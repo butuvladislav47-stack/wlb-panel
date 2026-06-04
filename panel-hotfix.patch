@@ -1,0 +1,237 @@
+--- remote-panel.py
++++ 0.0.2/panel.py
+@@ -47,6 +47,9 @@
+ WB_LOGIN_URL = "https://stream.wb.ru/login"
+ WB_DEVICE_STORAGE_KEY = "wb_auth_api_device_id"
+ REQUIRED_COOKIE_NAMES = ["wbx-refresh", "x_wbaas_token", "_wbauid", "__wb_device_id", "wbx-validation-key"]
++SESSION_RESTART_DELAY = 5
++SESSION_RESTART_LIMIT = 5
++SESSION_RESTART_WINDOW = 600
+ 
+ for p in [BASE_DIR, SESSIONS_DIR, LOG_DIR, CONFIG_DIR, CHROME_PROFILE]:
+     p.mkdir(parents=True, exist_ok=True)
+@@ -107,6 +110,16 @@
+         pid = int(pid)
+         os.kill(pid, 0)
+         return True
++    except Exception:
++        return False
++
++
++def creator_pid_alive(pid):
++    if not pid_alive(pid):
++        return False
++    try:
++        cmdline = Path(f"/proc/{int(pid)}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
++        return str(CREATOR_BIN) in cmdline
+     except Exception:
+         return False
+ 
+@@ -141,13 +154,15 @@
+         st = load_json(d / "state.json", {})
+         pid = st.get("pid")
+         link = read_text(d / "link.txt", "").strip()
+-        running = bool(pid and pid_alive(pid))
++        running = bool(pid and creator_pid_alive(pid))
+         out.append({
+             "name": d.name,
+             "pid": pid,
+             "running": running,
+             "link": link,
+             "created_at": st.get("created_at", ""),
++            "restart_count": st.get("restart_count", 0),
++            "last_error": st.get("last_error", ""),
+             "log": str(d / "log.txt"),
+         })
+     return out
+@@ -186,7 +201,7 @@
+     with open(log_file, "a", encoding="utf-8", errors="replace") as log:
+         log.write(f"CMD: {' '.join(cmd)}\n")
+         log.flush()
+-        return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, preexec_fn=os.setsid)
++        return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+ 
+ 
+ def stop_browser_stack():
+@@ -447,44 +462,103 @@
+     return st
+ 
+ 
+-def start_session(name):
++def creator_command(link_path, room=""):
++    cmd = [str(CREATOR_BIN), "--resources", "default", "--cookies", str(COOKIES_PATH)]
++    if room:
++        cmd += ["--room", room]
++    else:
++        cmd += ["--write-file", str(link_path)]
++    return cmd
++
++
++def launch_session(name, room="", restart_count=0):
+     name = safe_name(name)
+     d = session_dir(name)
+     d.mkdir(parents=True, exist_ok=True)
+     log_path = d / "log.txt"
+     link_path = d / "link.txt"
+-    # Stop existing process.
+     st = load_json(d / "state.json", {})
+-    if st.get("pid") and pid_alive(st.get("pid")):
++    if st.get("pid") and creator_pid_alive(st.get("pid")):
+         kill_pid(st.get("pid"))
+-    try:
+-        link_path.unlink()
+-    except Exception:
+-        pass
+     if not CREATOR_BIN.exists():
+         raise RuntimeError(f"Не найден {CREATOR_BIN}")
+     cs = cookie_status()
+     if not cs["ok"]:
+         raise RuntimeError("Нельзя создать ссылку: " + cs["message"])
+-    cmd = [str(CREATOR_BIN), "--write-file", str(link_path), "--resources", "moderate"]
+-    if COOKIES_PATH.exists():
+-        cmd += ["--cookies", str(COOKIES_PATH)]
++    cmd = creator_command(link_path, room)
+     with open(log_path, "a", encoding="utf-8", errors="replace") as log:
+-        log.write(f"\n=== START {now()} ===\nCMD: {' '.join(cmd)}\n")
++        action = "RESTART" if room else "START"
++        log.write(f"\n=== {action} {now()} ===\nCMD: {' '.join(cmd)}\n")
+         log.flush()
+-        p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
+-    save_json(d / "state.json", {"name": name, "pid": p.pid, "created_at": now(), "cmd": cmd})
++        p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
++    save_json(d / "state.json", {
++        "name": name,
++        "pid": p.pid,
++        "created_at": st.get("created_at") or now(),
++        "last_started_at": now(),
++        "restart_count": restart_count,
++        "restart_window_started": st.get("restart_window_started") or time.time(),
++        "desired": True,
++        "cmd": cmd,
++    })
+     time.sleep(1.0)
+     if p.poll() is not None:
+         raise RuntimeError("Creator завершился сразу после запуска:\n" + read_text(log_path, "")[-3000:])
+     return name
+ 
+ 
++def start_session(name):
++    name = safe_name(name)
++    d = session_dir(name)
++    d.mkdir(parents=True, exist_ok=True)
++    st = load_json(d / "state.json", {})
++    if st.get("pid") and creator_pid_alive(st.get("pid")):
++        kill_pid(st.get("pid"))
++    try:
++        (d / "link.txt").unlink()
++    except Exception:
++        pass
++    return launch_session(name)
++
++
++def session_supervisor():
++    while True:
++        time.sleep(SESSION_RESTART_DELAY)
++        for s in list_sessions():
++            if s["running"]:
++                continue
++            d = session_dir(s["name"])
++            st = load_json(d / "state.json", {})
++            if not st.get("desired", True):
++                continue
++            room = read_text(d / "link.txt", "").strip()
++            if not room:
++                continue
++            window_started = float(st.get("restart_window_started") or 0)
++            restart_count = int(st.get("restart_count") or 0)
++            if time.time() - window_started > SESSION_RESTART_WINDOW:
++                window_started = time.time()
++                restart_count = 0
++                st["restart_window_started"] = window_started
++                save_json(d / "state.json", st)
++            if restart_count >= SESSION_RESTART_LIMIT:
++                continue
++            try:
++                launch_session(s["name"], room=room, restart_count=restart_count + 1)
++            except Exception as e:
++                st = load_json(d / "state.json", {})
++                st["last_error"] = repr(e)
++                st["restart_count"] = restart_count + 1
++                save_json(d / "state.json", st)
++
++
+ def delete_session(name):
+     name = safe_name(name)
+     d = session_dir(name)
+     st = load_json(d / "state.json", {})
+-    if st.get("pid") and pid_alive(st.get("pid")):
++    st["desired"] = False
++    save_json(d / "state.json", st)
++    if st.get("pid") and creator_pid_alive(st.get("pid")):
+         kill_pid(st.get("pid"))
+     if d.exists():
+         shutil.rmtree(d, ignore_errors=True)
+@@ -539,12 +613,15 @@
+ 
+     def is_authed(self):
+         cfg = get_config()
+-        token = cfg.get("session_token")
+-        if not token:
+-            return False
+         c = cookies.SimpleCookie(self.headers.get("Cookie", ""))
+         got = c.get("wlb_session")
+-        return bool(got and hmac.compare_digest(got.value, token))
++        if not got:
++            return False
++        tokens = cfg.get("session_tokens", [])
++        legacy = cfg.get("session_token")
++        if legacy:
++            tokens.append(legacy)
++        return any(hmac.compare_digest(got.value, token) for token in tokens if isinstance(token, str))
+ 
+     def require_auth(self):
+         if not self.is_authed():
+@@ -596,7 +673,10 @@
+         cfg = get_config()
+         if u == cfg.get("username", "admin") and hmac.compare_digest(sha256_hex(p), cfg.get("password_sha256", "")):
+             token = secrets.token_urlsafe(32)
+-            cfg["session_token"] = token
++            tokens = [x for x in cfg.get("session_tokens", []) if isinstance(x, str)]
++            tokens.append(token)
++            cfg["session_tokens"] = tokens[-8:]
++            cfg.pop("session_token", None)
+             save_config(cfg)
+             self.send_response(302)
+             self.send_header("Location", "/")
+@@ -606,7 +686,12 @@
+             self.send_html(render_page("Login", "<div class='card'><h2>Неверный логин или пароль</h2><p><a class='btn' href='/login'>Повторить</a></p></div>", err=True), 403)
+ 
+     def logout(self):
+-        cfg = get_config(); cfg.pop("session_token", None); save_config(cfg)
++        cfg = get_config()
++        c = cookies.SimpleCookie(self.headers.get("Cookie", ""))
++        got = c.get("wlb_session")
++        if got:
++            cfg["session_tokens"] = [x for x in cfg.get("session_tokens", []) if not hmac.compare_digest(x, got.value)]
++        save_config(cfg)
+         self.send_response(302); self.send_header("Location", "/login"); self.send_header("Set-Cookie", "wlb_session=deleted; Max-Age=0; Path=/"); self.end_headers()
+ 
+     def index(self, flash=""):
+@@ -617,7 +702,8 @@
+             status = "active" if s["running"] else "stopped"
+             status_cls = "good" if s["running"] else "bad"
+             link = f"<div class='linkbox'>{esc(s['link'])}</div>" if s["link"] else "<span class='muted'>ссылка ещё создаётся...</span>"
+-            rows.append(f"<tr><td><b>{esc(s['name'])}</b><br><span class='muted'>PID: {esc(s['pid'] or '-')}</span></td><td><span class='pill {status_cls}'>{status}</span></td><td>{link}</td><td><div class='row'><a class='btn' href='/logs/{esc(s['name'])}'>Логи</a><form method='post' action='/delete' onsubmit='return confirm(\"Удалить ссылку?\")'><input type='hidden' name='name' value='{esc(s['name'])}'><button class='btn danger'>Удалить</button></form></div></td></tr>")
++            restart_info = f"<br><span class='muted'>Автовосстановлений: {esc(s['restart_count'])}</span>" if s["restart_count"] else ""
++            rows.append(f"<tr><td><b>{esc(s['name'])}</b><br><span class='muted'>PID: {esc(s['pid'] or '-')}</span>{restart_info}</td><td><span class='pill {status_cls}'>{status}</span></td><td>{link}</td><td><div class='row'><a class='btn' href='/logs/{esc(s['name'])}'>Логи</a><form method='post' action='/delete' onsubmit='return confirm(\"Удалить ссылку?\")'><input type='hidden' name='name' value='{esc(s['name'])}'><button class='btn danger'>Удалить</button></form></div></td></tr>")
+         if not rows:
+             rows.append("<tr><td colspan='4' class='muted'>Пока нет ссылок.</td></tr>")
+         body = f"""
+@@ -737,6 +823,7 @@
+         save_config(cfg)
+         print("Generated password:", pw)
+     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
++    threading.Thread(target=session_supervisor, name="session-supervisor", daemon=True).start()
+     print(f"{APP_NAME} {VERSION} listening on {HOST}:{PORT}", flush=True)
+     httpd.serve_forever()
+ 
