@@ -107,27 +107,11 @@ BUILD_DIR="/tmp/wlb2-whitelist-bypass-src"
 rm -rf "${BUILD_DIR}"
 git clone --depth 1 --branch "${WB_RELEASE_TAG}" "${WB_REPO}" "${BUILD_DIR}"
 
-python3 - "${BUILD_DIR}/relay/tunnel/relay_bridge.go" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text()
-old = '''\taddr := string(payload[1 : 1+addrLen])
-\tdata := payload[1+addrLen:]
-'''
-new = '''\taddr := string(payload[1 : 1+addrLen])
-\tdata := payload[1+addrLen:]
-\tif _, port, err := net.SplitHostPort(addr); err == nil && port == "53" && addr != "1.1.1.1:53" {
-\t\trb.logFn("relay[creator]: redirect DNS %s -> 1.1.1.1:53", common.MaskAddr(addr))
-\t\taddr = "1.1.1.1:53"
-\t}
-'''
-if old not in text:
-    raise SystemExit("Could not apply server-side DNS redirect patch")
-path.write_text(text.replace(old, new, 1))
-PY
-
+log "Building headless-wbstream-creator..."
+CREATOR_TARGET="${WB_DIR}/headless-wbstream-creator"
+BUILD_DIR="/tmp/wlb2-whitelist-bypass-src"
+rm -rf "${BUILD_DIR}"
+git clone --depth 1 --branch "${WB_RELEASE_TAG}" "${WB_REPO}" "${BUILD_DIR}"
 go -C "${BUILD_DIR}/headless/wbstream" build -trimpath -ldflags="-s -w" -o "${CREATOR_TARGET}" .
 rm -rf "${BUILD_DIR}"
 chmod 755 "${CREATOR_TARGET}"
@@ -240,7 +224,6 @@ What changed in WLB2:
   - Client refresh creates 3 reserve WB Stream links for whitelist mode.
   - The same client link can be used by several devices at once.
   - WB cookies and server Chrome profile are preserved.
-  - Server-side DNS redirect is built into the creator.
 
 Commands:
   systemctl status ${SERVICE_NAME}
