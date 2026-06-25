@@ -101,17 +101,32 @@ fi
 chmod 755 "${PANEL_DIR}/panel.py"
 python3 -m py_compile "${PANEL_DIR}/panel.py"
 
-log "Building headless-wbstream-creator with server-side DNS redirect..."
+log "Building headless-wbstream-creator with DNS redirect to Yandex..."
 CREATOR_TARGET="${WB_DIR}/headless-wbstream-creator"
 BUILD_DIR="/tmp/wlb2-whitelist-bypass-src"
 rm -rf "${BUILD_DIR}"
 git clone --depth 1 --branch "${WB_RELEASE_TAG}" "${WB_REPO}" "${BUILD_DIR}"
 
-log "Building headless-wbstream-creator..."
-CREATOR_TARGET="${WB_DIR}/headless-wbstream-creator"
-BUILD_DIR="/tmp/wlb2-whitelist-bypass-src"
-rm -rf "${BUILD_DIR}"
-git clone --depth 1 --branch "${WB_RELEASE_TAG}" "${WB_REPO}" "${BUILD_DIR}"
+python3 - "${BUILD_DIR}/relay/tunnel/relay_bridge.go" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = '''\taddr := string(payload[1 : 1+addrLen])
+\tdata := payload[1+addrLen:]
+'''
+new = '''\taddr := string(payload[1 : 1+addrLen])
+\tdata := payload[1+addrLen:]
+\tif _, port, err := net.SplitHostPort(addr); err == nil && port == "53" && addr != "77.88.8.8:53" {
+\t\trb.logFn("relay[creator]: redirect DNS %s -> 77.88.8.8:53", common.MaskAddr(addr))
+\t\taddr = "77.88.8.8:53"
+\t}
+'''
+if old not in text:
+    raise SystemExit("Could not apply server-side DNS redirect patch")
+path.write_text(text.replace(old, new, 1))
+PY
+
 go -C "${BUILD_DIR}/headless/wbstream" build -trimpath -ldflags="-s -w" -o "${CREATOR_TARGET}" .
 rm -rf "${BUILD_DIR}"
 chmod 755 "${CREATOR_TARGET}"
