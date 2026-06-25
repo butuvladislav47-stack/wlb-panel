@@ -153,9 +153,3 @@ Ports to open in hosting firewall:
 
 - `8088/tcp` for the panel and client API;
 - `6080/tcp` for noVNC.
-
-## DNS
-
-The installer builds `headless-wbstream-creator` with server-side DNS redirect.
-The Android app can keep `DNS: System`; DNS traffic sent to local router DNS is
-redirected by the server to `1.1.1.1`.
